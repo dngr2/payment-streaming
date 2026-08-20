@@ -94,6 +94,27 @@ contract StreamHandler is CommonBase, StdCheats, StdUtils {
         mgr.cancel(id);
     }
 
+    function topUp(uint256 idSeed, uint256 amtSeed) external {
+        if (streamIds.length == 0) return;
+        uint256 id = streamIds[idSeed % streamIds.length];
+        StreamManager.Stream memory s = mgr.getStream(id);
+        if (s.canceled) return;
+        if (block.timestamp >= s.endTime) return;
+
+        uint256 amount = bound(amtSeed, 1e6, 1_000_000e18);
+        token.mint(s.sender, amount);
+        vm.startPrank(s.sender);
+        token.approve(address(mgr), amount);
+        mgr.topUp(id, amount);
+        vm.stopPrank();
+
+        uint256 fee = (amount * mgr.feeBps()) / mgr.MAX_BPS();
+        gReceived[id] += amount; // MockERC20 has no transfer fee => received == amount
+        gFee[id] += fee;
+        gTotalReceived += amount;
+        gTotalFees += fee;
+    }
+
     function warp(uint256 secondsSeed) external {
         uint256 step = bound(secondsSeed, 1 hours, 30 days);
         vm.warp(block.timestamp + step);

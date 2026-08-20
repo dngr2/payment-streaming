@@ -74,6 +74,25 @@ Highlights:
   for every stream `deposited == withdrawn + remaining + returnedToSender + fee`, and the
   contract's token balance always covers outstanding obligations.
 
+## Deep dive (v2): hardening + top-up + batch create
+
+A line-by-line security pass over `streamedAmount` math (boundaries, cliff jump,
+floor rounding), the cancel split, withdraw bounds, fee-on-transfer conservation and
+reentrancy found **no exploitable bug** — the release curve and accounting are sound.
+Two features were added, both conservation-preserving and covered by the funds
+invariant handler:
+
+- **`topUp(streamId, addedAmount)`** — the sender adds principal to a live (non-ended,
+  non-canceled) stream. The end time is extended to hold the per-second rate constant
+  (`newDuration = oldDuration * newDeposit / oldDeposit`), so the already-streamed figure
+  is unchanged at the moment of top-up (no retroactive release, no withdrawable
+  underflow). Fee-on-transfer safe; pays the same bounded protocol fee as a fresh deposit.
+- **`createStreamBatch(CreateParams[])`** — create many streams atomically in one tx;
+  any failing element reverts the whole batch.
+
+Plus a hot-path withdraw refactor (single storage resolution shared by `withdraw` /
+`withdrawMax`) and a mutation sanity check on the streamed-math and cancel-split.
+
 ## License
 
 MIT

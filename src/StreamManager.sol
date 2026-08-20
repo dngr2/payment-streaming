@@ -31,7 +31,6 @@ contract StreamManager is ReentrancyGuard, Ownable {
         Settled, // fully released (>= end) but not fully withdrawn
         Canceled, // canceled by sender or recipient; balances settled
         Depleted // principal fully withdrawn
-
     }
 
     /// @param sender The creator/funder, and refund beneficiary on cancel.
@@ -57,6 +56,17 @@ contract StreamManager is ReentrancyGuard, Ownable {
         uint40 endTime;
         bool cancelable;
         bool canceled;
+    }
+
+    /// @notice Parameters for one stream in a batch create.
+    struct CreateParams {
+        address recipient;
+        address token;
+        uint256 totalAmount;
+        uint40 startTime;
+        uint40 cliffTime;
+        uint40 endTime;
+        bool cancelable;
     }
 
     // -------------------------------------------------------------------------
@@ -108,6 +118,9 @@ contract StreamManager is ReentrancyGuard, Ownable {
         uint256 recipientAmount,
         uint256 senderRefund
     );
+    event ToppedUp(
+        uint256 indexed streamId, address indexed funder, uint256 addedPrincipal, uint256 fee, uint40 newEndTime
+    );
     event TransferRecipient(uint256 indexed streamId, address indexed oldRecipient, address indexed newRecipient);
     event ApproveWithdrawer(uint256 indexed streamId, address indexed spender);
     event SetFeeRecipient(address indexed oldRecipient, address indexed newRecipient);
@@ -128,6 +141,7 @@ contract StreamManager is ReentrancyGuard, Ownable {
     error Overdraw(uint256 streamId, uint256 requested, uint256 withdrawable);
     error NotCancelable(uint256 streamId);
     error AlreadyCanceled(uint256 streamId);
+    error StreamEnded(uint256 streamId);
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -187,6 +201,37 @@ contract StreamManager is ReentrancyGuard, Ownable {
         uint40 endTime,
         bool cancelable
     ) external nonReentrant returns (uint256 streamId) {
+        streamId = _createStream(recipient, token, totalAmount, startTime, cliffTime, endTime, cancelable);
+    }
+
+    /// @notice Create many streams in a single transaction. Each is funded and fee'd
+    ///         independently exactly as `createStream`; any failing element reverts the batch.
+    /// @param params Per-stream creation parameters.
+    /// @return streamIds The ids of the newly created streams, in input order.
+    function createStreamBatch(CreateParams[] calldata params)
+        external
+        nonReentrant
+        returns (uint256[] memory streamIds)
+    {
+        uint256 len = params.length;
+        if (len == 0) revert ZeroAmount();
+        streamIds = new uint256[](len);
+        for (uint256 i = 0; i < len; i++) {
+            CreateParams calldata p = params[i];
+            streamIds[i] =
+                _createStream(p.recipient, p.token, p.totalAmount, p.startTime, p.cliffTime, p.endTime, p.cancelable);
+        }
+    }
+
+    function _createStream(
+        address recipient,
+        address token,
+        uint256 totalAmount,
+        uint40 startTime,
+        uint40 cliffTime,
+        uint40 endTime,
+        bool cancelable
+    ) private returns (uint256 streamId) {
         if (recipient == address(0) || token == address(0)) revert ZeroAddress();
         if (totalAmount == 0) revert ZeroAmount();
         if (endTime <= startTime) revert InvalidTimeRange(startTime, endTime);
@@ -237,16 +282,17 @@ contract StreamManager is ReentrancyGuard, Ownable {
     /// @notice Withdraw up to the withdrawable amount to the recipient.
     /// @dev Callable by the recipient or an approved withdrawer.
     function withdraw(uint256 streamId, uint256 amount) external nonReentrant {
-        _withdraw(streamId, amount);
+        _withdraw(streamId, amount, false);
     }
 
     /// @notice Withdraw the full withdrawable amount to the recipient.
     function withdrawMax(uint256 streamId) external nonReentrant returns (uint256 amount) {
-        amount = withdrawableAmount(streamId);
-        _withdraw(streamId, amount);
+        amount = _withdraw(streamId, 0, true);
     }
 
-    function _withdraw(uint256 streamId, uint256 amount) private {
+    /// @dev Single storage resolution on the hot path. When `max` is set the amount
+    ///      is the full withdrawable balance; otherwise `amount` is bounded-checked.
+    function _withdraw(uint256 streamId, uint256 amount, bool max) private returns (uint256) {
         Stream storage s = _streams[streamId];
         if (s.sender == address(0)) revert StreamNull(streamId);
 
@@ -254,17 +300,22 @@ contract StreamManager is ReentrancyGuard, Ownable {
         if (msg.sender != recipient && msg.sender != _approved[streamId]) {
             revert Unauthorized(streamId, msg.sender);
         }
-        if (amount == 0) revert ZeroAmount();
 
-        uint256 withdrawable = withdrawableAmount(streamId);
-        if (amount > withdrawable) revert Overdraw(streamId, amount, withdrawable);
+        uint256 withdrawable = _streamedAmount(s) - s.withdrawn;
+        if (max) {
+            amount = withdrawable;
+        }
+        if (amount == 0) revert ZeroAmount();
+        if (!max && amount > withdrawable) revert Overdraw(streamId, amount, withdrawable);
 
         // Effects
         s.withdrawn += uint128(amount);
 
         // Interactions
+        address token = s.token;
         emit WithdrawFromStream(streamId, recipient, msg.sender, amount);
-        IERC20(s.token).safeTransfer(recipient, amount);
+        IERC20(token).safeTransfer(recipient, amount);
+        return amount;
     }
 
     // -------------------------------------------------------------------------
@@ -302,6 +353,61 @@ contract StreamManager is ReentrancyGuard, Ownable {
         // Interactions
         if (recipientAmount != 0) token.safeTransfer(recipient, recipientAmount);
         if (senderRefund != 0) token.safeTransfer(sender, senderRefund);
+    }
+
+    // -------------------------------------------------------------------------
+    // Top-up
+    // -------------------------------------------------------------------------
+
+    /// @notice Add principal to a live stream, extending its end time to keep the
+    ///         per-second release rate constant (a top-up buys more time, not a raise).
+    /// @dev Sender-only, for a non-canceled stream that has not yet ended. The added
+    ///      amount is fee-on-transfer safe and pays the same bounded protocol fee as a
+    ///      fresh deposit. `newDuration = oldDuration * newDeposit / oldDeposit`, so the
+    ///      currently-streamed figure is unchanged at the moment of top-up (no retroactive
+    ///      release). Start time and cliff are untouched.
+    /// @param streamId The stream to top up.
+    /// @param addedAmount Tokens to pull from the sender (pre fee-on-transfer, pre protocol fee).
+    /// @return newEndTime The stream's end time after the extension.
+    function topUp(uint256 streamId, uint256 addedAmount) external nonReentrant returns (uint40 newEndTime) {
+        Stream storage s = _streams[streamId];
+        if (s.sender == address(0)) revert StreamNull(streamId);
+        if (msg.sender != s.sender) revert Unauthorized(streamId, msg.sender);
+        if (s.canceled) revert AlreadyCanceled(streamId);
+        if (addedAmount == 0) revert ZeroAmount();
+        if (block.timestamp >= s.endTime) revert StreamEnded(streamId);
+
+        // Credit added principal from tokens actually received (fee-on-transfer safe).
+        IERC20 erc20 = IERC20(s.token);
+        uint256 balanceBefore = erc20.balanceOf(address(this));
+        erc20.safeTransferFrom(msg.sender, address(this), addedAmount);
+        uint256 received = erc20.balanceOf(address(this)) - balanceBefore;
+        if (received == 0) revert NothingReceived();
+
+        uint256 fee = Math.mulDiv(received, feeBps, MAX_BPS);
+        uint256 added = received - fee;
+        if (added == 0) revert NothingReceived();
+
+        uint256 oldDeposit = s.deposit;
+        uint256 newDeposit = oldDeposit + added;
+
+        // Extend end time to hold the per-second rate constant. Floor rounding shortens
+        // the duration marginally, so the rate can only round *up* — the streamed figure
+        // never drops below what was already streamed (no withdrawable underflow).
+        uint256 oldDuration = uint256(s.endTime) - s.startTime;
+        uint256 newDuration = Math.mulDiv(oldDuration, newDeposit, oldDeposit);
+        newEndTime = (uint256(s.startTime) + newDuration).toUint40();
+
+        // Effects
+        s.deposit = newDeposit.toUint128();
+        s.endTime = newEndTime;
+
+        emit ToppedUp(streamId, msg.sender, added, fee, newEndTime);
+
+        // Interactions
+        if (fee != 0) {
+            erc20.safeTransfer(feeRecipient, fee);
+        }
     }
 
     // -------------------------------------------------------------------------
