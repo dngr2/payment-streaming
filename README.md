@@ -1,98 +1,138 @@
-# StreamManager — continuous token payment streams
+# StreamManager — continuous ERC20 payment streams
 
-A single Solidity contract that multiplexes many id-keyed ERC20 payment streams
-(Sablier-style). Money is released to the recipient continuously over time rather
-than in a lump sum. Built for **payroll, grants, and vesting-as-a-stream**.
+One Solidity contract that pays money out continuously over time instead of in a
+lump sum. Lock a total, set a start, an optional cliff, and an end; the recipient's
+balance then accrues by the second and is withdrawable at any moment. A single
+contract runs unlimited concurrent, id-keyed streams. Built for **payroll, grants,
+and vesting-as-a-stream**.
 
 Clean-room implementation on OpenZeppelin v5 (`SafeERC20`, `ReentrancyGuard`,
-`Ownable`, `Math.mulDiv`). Foundry-tested (unit + invariant).
+`Ownable`, `Math.mulDiv`, `SafeCast`), Solidity 0.8.26, Foundry.
 
-## The model: linear release with an optional cliff
+## The edge: the accounting is provably conservative
+
+Continuous-payment contracts live or die on one property — the money in must always
+equal the money out, at every point on the curve, forever. This one is built around
+that property and holds a stateful invariant to it.
+
+- **Funds-coverage invariant.** A fuzz campaign drives a random sequence of
+  create / withdraw / cancel / top-up calls with time warps across many concurrent
+  streams, and after every step asserts, for each stream:
+  `received == withdrawn + remaining + refunded + feeAtCreation` (with
+  `deposit == received − feeAtCreation`). The contract's token balance is asserted
+  to always cover the sum of outstanding obligations — exactly for a normal token,
+  and never below for a fee-on-transfer one. **A recipient can never withdraw more
+  than was deposited, and no dust is left stranded.**
+- **Cliff + linear math verified at the boundaries.** The release curve is checked
+  at `t < start`, at the cliff edge (withdrawable jumps to the linear-from-start
+  value and "catches up"), at multiple mid-points, and at/after `end`. Division is
+  `Math.mulDiv` (full-precision, floor rounding), so the recipient can never
+  withdraw more than has actually accrued.
+- **Cancel splits streamed-vs-unstreamed exactly.** On cancel the recipient is paid
+  `streamed − withdrawn` and the sender is refunded `deposit − streamed`; the two
+  sum to the outstanding balance with nothing left over and nothing lost.
+- **Fee-on-transfer safe.** Principal is credited from tokens *actually received*
+  (`balanceAfter − balanceBefore`), not from the requested amount, so a
+  deflationary token can never leave a stream under-funded.
+- **Reentrancy safe.** Every value-moving function is `nonReentrant` and follows
+  checks-effects-interactions — storage is settled before any token transfer.
+- **No admin path to stream funds.** The owner can only set the fee recipient and a
+  fee bounded at 10% (`MAX_FEE_BPS = 1_000`, enforced on-chain). There is no
+  function by which the owner can move, freeze, or seize a stream's principal.
+
+## The release model
 
 Each stream releases its principal linearly from `startTime` to `endTime`:
 
 ```
 streamedAmount(t) =
-    0                                   if t < startTime
-    0                                   if cliff set and t < cliffTime
-    deposit                             if t >= endTime
+    0                                                   if t < startTime
+    0                                                   if cliff set and t < cliffTime
+    deposit                                             if t >= endTime
     deposit * (t - startTime) / (endTime - startTime)   otherwise
 ```
 
-- The curve is **linear from start to end**. A cliff does not change the slope; it
-  only suppresses withdrawals until `cliffTime`, at which point the withdrawable
-  balance jumps to the linear-from-start value (it "catches up").
-- `withdrawableAmount = streamedAmount − withdrawn`.
-- The division uses `Math.mulDiv` (full-precision, floor rounding), so the recipient
-  can never withdraw more than has actually accrued.
+A cliff does not change the slope — it only suppresses withdrawals until
+`cliffTime`, after which the withdrawable balance equals the linear-from-start value.
+`withdrawableAmount = streamedAmount − withdrawn`. Once canceled, the streamed figure
+is frozen at the cancel point.
 
-## Cancel semantics
+Status lifecycle: `Pending → Streaming → Settled → Depleted`, or `Canceled` at any point.
 
-A stream may be created `cancelable` or not.
+## Features
 
-- **Cancelable**: the sender *or* the recipient can `cancel`. Balances settle
-  immediately — the recipient is paid the streamed-but-unwithdrawn amount
-  (`streamed − withdrawn`) and the sender is refunded the unstreamed remainder
-  (`deposit − streamed`). The stream then holds nothing and is `Canceled`.
-- **Non-cancelable**: `cancel` reverts. Funds are locked to the schedule.
+- **Create** a linear stream with an optional cliff, cancelable or not.
+- **Withdraw** any amount up to the withdrawable balance, or `withdrawMax`. Callable
+  by the recipient or an approved withdrawer.
+- **Cancel** (sender or recipient, cancelable streams only) with the exact split above.
+- **`topUp(streamId, addedAmount)` (v2)** — the sender adds principal to a live
+  (non-ended, non-canceled) stream. The end time is extended to hold the per-second
+  rate constant (`newDuration = oldDuration * newDeposit / oldDeposit`), so a top-up
+  buys more time rather than granting a retroactive raise; the already-streamed figure
+  is unchanged at the moment of top-up. Fee-on-transfer safe; pays the same bounded fee.
+- **`createStreamBatch(CreateParams[])` (v2)** — create many streams atomically in one
+  transaction; any failing element reverts the whole batch.
+- **Recipient management** — `transferRecipient` moves stream ownership (and clears any
+  approval); `approveWithdrawer` delegates withdrawal without transferring ownership.
+- **Per-stream protocol fee** — a bounded fee is skimmed **once, at creation** (never on
+  withdrawal or cancel), from tokens actually received.
 
-No admin path can seize or redirect stream funds. The owner can only configure the
-protocol fee (bounded) and fee recipient.
+## Security & testing
 
-## Per-stream protocol fee
+Foundry, all green:
 
-At creation the sender deposits `totalAmount`. The contract credits the principal
-from tokens **actually received** (fee-on-transfer safe), then skims a bounded
-protocol fee to the `feeRecipient`:
-
-```
-received  = balanceAfter − balanceBefore      // fee-on-transfer safe
-fee       = received * feeBps / 10_000        // feeBps <= 1000 (10% hard cap)
-principal = received − fee                     // the streamed deposit
-```
-
-The fee is taken **once, at creation** — never on withdrawal or cancel.
-
-## Status lifecycle
-
-`Pending → Streaming → Settled → Depleted`, or `Canceled` at any point.
-
-## Test
+- **49 unit tests** — exact linear arithmetic at mid-points, the cliff edge, and after
+  end; partial / max withdraw; over-withdraw, unauthorized-withdraw and post-cancel
+  reverts; mid-stream cancel split; fee-on-transfer conservation; fee skimming;
+  malformed-parameter reverts; and the v2 `topUp` (rate-preserving) and batch-create paths.
+- **1 stateful invariant** — `invariant_FundsConserved`, the funds-coverage invariant
+  described above, run over a bounded fuzz campaign. It passes green; it is slow
+  (~12 min locally), so it is run on its own:
 
 ```bash
-forge test        # unit + invariant suites
-forge test -vvv   # verbose
+forge test --no-match-contract Invariant   # the 49 unit tests, fast
+forge test --match-contract  Invariant     # the funds-coverage invariant (slow)
 ```
 
-Highlights:
-- Exact linear arithmetic at multiple mid-points, at the cliff edge, and after end.
-- Partial/max withdraw, over-withdraw and unauthorized-withdraw reverts.
-- Mid-stream cancel splits exactly; post-cancel withdrawals blocked; non-cancelable reverts.
-- Fee-on-transfer token: principal credited from actual received; accounting conserved.
-- Protocol fee skimmed correctly; malformed params revert.
-- **Funds-conservation invariant** over a bounded create/withdraw/cancel/warp campaign:
-  for every stream `deposited == withdrawn + remaining + returnedToSender + fee`, and the
-  contract's token balance always covers outstanding obligations.
+A line-by-line review of the `streamedAmount` math, the cancel split, withdraw bounds,
+fee-on-transfer conservation and reentrancy found no exploitable bug. During that pass,
+individual pieces of the streamed-math and cancel-split were mutated by hand and
+confirmed to break a test — a spot check that the suite catches the arithmetic it
+claims to, not a full mutation-testing run.
 
-## Deep dive (v2): hardening + top-up + batch create
+Indicative gas from `forge test --gas-report` (median): `createStream` ~188k,
+`withdraw` ~76k, `cancel` ~86k, `topUp` ~50k.
 
-A line-by-line security pass over `streamedAmount` math (boundaries, cliff jump,
-floor rounding), the cancel split, withdraw bounds, fee-on-transfer conservation and
-reentrancy found **no exploitable bug** — the release curve and accounting are sound.
-Two features were added, both conservation-preserving and covered by the funds
-invariant handler:
+## Usage
 
-- **`topUp(streamId, addedAmount)`** — the sender adds principal to a live (non-ended,
-  non-canceled) stream. The end time is extended to hold the per-second rate constant
-  (`newDuration = oldDuration * newDeposit / oldDeposit`), so the already-streamed figure
-  is unchanged at the moment of top-up (no retroactive release, no withdrawable
-  underflow). Fee-on-transfer safe; pays the same bounded protocol fee as a fresh deposit.
-- **`createStreamBatch(CreateParams[])`** — create many streams atomically in one tx;
-  any failing element reverts the whole batch.
+```solidity
+// Approve first: token.approve(address(mgr), totalAmount);
 
-Plus a hot-path withdraw refactor (single storage resolution shared by `withdraw` /
-`withdrawMax`) and a mutation sanity check on the streamed-math and cancel-split.
+// A 1-year salary stream with a 90-day cliff, cancelable.
+uint256 id = mgr.createStream(
+    employee,                          // recipient
+    address(token),                    // ERC20 to stream
+    120_000e18,                        // totalAmount pulled from the sender (pre-fee)
+    uint40(block.timestamp),           // startTime
+    uint40(block.timestamp + 90 days), // cliffTime (0 for no cliff)
+    uint40(block.timestamp + 365 days),// endTime
+    true                               // cancelable
+);
+
+// Recipient collects what has accrued, any time.
+uint256 got = mgr.withdrawMax(id);           // or mgr.withdraw(id, amount);
+
+// Sender adds budget mid-stream; end time extends, per-second rate held constant.
+uint40 newEnd = mgr.topUp(id, 30_000e18);
+
+// Either party ends it early: recipient keeps what streamed, sender is refunded the rest.
+mgr.cancel(id);
+```
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
+
+Honest note: this is an independent, unaudited implementation. It is thoroughly
+unit- and invariant-tested and written defensively, but it has not had a third-party
+security audit. Review it yourself before putting funds at risk.
