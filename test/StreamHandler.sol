@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {CommonBase} from "forge-std/Base.sol";
 import {StdCheats} from "forge-std/StdCheats.sol";
 import {StdUtils} from "forge-std/StdUtils.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {StreamManager} from "../src/StreamManager.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 
@@ -38,6 +39,12 @@ contract StreamHandler is CommonBase, StdCheats, StdUtils {
         return actors[seed % actors.length];
     }
 
+    /// @dev The actor after `_actor(seed)`, guaranteed distinct. Reduce before the
+    ///      increment so a max-uint seed can never overflow (a harness-only concern).
+    function _actorNext(uint256 seed) internal view returns (address) {
+        return actors[(seed % actors.length + 1) % actors.length];
+    }
+
     function streamCount() external view returns (uint256) {
         return streamIds.length;
     }
@@ -50,7 +57,7 @@ contract StreamHandler is CommonBase, StdCheats, StdUtils {
         external
     {
         address sender = _actor(actorSeed);
-        address recipient = _actor(actorSeed + 1);
+        address recipient = _actorNext(actorSeed);
 
         uint256 amount = bound(amtSeed, 1e6, 1_000_000e18);
         uint40 start = uint40(bound(startSeed, block.timestamp, block.timestamp + 5 days));
@@ -101,7 +108,22 @@ contract StreamHandler is CommonBase, StdCheats, StdUtils {
         if (s.canceled) return;
         if (block.timestamp >= s.endTime) return;
 
-        uint256 amount = bound(amtSeed, 1e6, 1_000_000e18);
+        // A rate-preserving top-up scales the stream's duration by newDeposit/oldDeposit.
+        // The contract stores endTime as uint40, so bound the added principal so the
+        // extended end time stays representable (a real top-up buys time; it cannot push
+        // the stream past the year-36812 ceiling of the uint40 time field). Without this
+        // the fuzzer can add ~1e18x the principal to a tiny stream and trip a SafeCast
+        // overflow — a safe revert, but one no legitimate call would reach.
+        uint256 oldDeposit = s.deposit;
+        uint256 oldDuration = uint256(s.endTime) - s.startTime;
+        uint256 maxNewDuration = uint256(type(uint40).max) - s.startTime;
+        uint256 maxNewDeposit = Math.mulDiv(maxNewDuration, oldDeposit, oldDuration);
+        if (maxNewDeposit <= oldDeposit) return; // no headroom to extend
+        uint256 maxAdded = maxNewDeposit - oldDeposit;
+        if (maxAdded < 1e6) return; // cannot make a >= min-size top-up without overflowing
+        uint256 upper = maxAdded < 1_000_000e18 ? maxAdded : 1_000_000e18;
+
+        uint256 amount = bound(amtSeed, 1e6, upper);
         token.mint(s.sender, amount);
         vm.startPrank(s.sender);
         token.approve(address(mgr), amount);

@@ -27,6 +27,7 @@ contract StreamManagerInvariant is Test {
     ///      Contract balance always covers the sum of outstanding obligations, and every
     ///      fee ever taken has been delivered to the fee recipient — funds are never
     ///      created or lost.
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_FundsConserved() public view {
         uint256 n = handler.streamCount();
         uint256 sumRemaining;
