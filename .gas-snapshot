@@ -1,3 +1,4 @@
+StreamManagerInvariant:invariant_FundsConserved() (runs: 64, calls: 12800, reverts: 0)
 StreamManagerTest:test_CancelBeforeStartRefundsAll() (gas: 192851)
 StreamManagerTest:test_CancelByRecipient() (gas: 220910)
 StreamManagerTest:test_CancelMidStreamSplitsExactly() (gas: 235504)
